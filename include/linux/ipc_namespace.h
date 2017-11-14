@@ -61,7 +61,35 @@ struct ipc_namespace {
 	struct ucounts *ucounts;
 
 	struct ns_common ns;
+	/* allow others to piggyback on ipc_namesspaces */
+	void *gen;                      /* for others' private stuff */
 };
+
+/*
+ * To access to the per-ipc generic data:
+ * 1. (un)register ops with (un)register_peripc_operations()
+ * 2. call ipc_assign_generic() to put private data on the ipc_namespace
+ * 3. call ipc_access_generic() to access the private data
+ * 4. do not change the pointer during the lifetime of ipc_namespace
+ *
+ * Modeled after generic net-ns pointers (commit dec827d), simplified for
+ * a single user case for now:
+ * 5. only one caller can register at a time
+ * 6. caller must register at boot time (not to be used by modules)
+ */
+struct peripc_operations {
+	int (*init)(struct ipc_namespace *);
+	void (*exit)(struct ipc_namespace *);
+};
+
+static inline void ipc_assign_generic(struct ipc_namespace *ns, void *data)
+{ ns->gen = data; }
+
+static inline void *ipc_access_generic(struct ipc_namespace *ns)
+{ return ns->gen; }
+
+extern int register_peripc_ops(struct peripc_operations *ops);
+extern void unregister_peripc_ops(struct peripc_operations *ops);
 
 extern struct ipc_namespace init_ipc_ns;
 extern spinlock_t mq_lock;

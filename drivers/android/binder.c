@@ -68,6 +68,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/pid_namespace.h>
+#include <linux/ipc_namespace.h>
 #include <linux/security.h>
 #include <linux/spinlock.h>
 
@@ -487,6 +488,102 @@ struct binder_priority {
 	int prio;
 };
 
+/*
+ * Using a private context manager for each binder namespace is sufficient
+ * to isolate between namespaces, because in binder all IPC must be realized
+ * via hanldes obtained from the context manager.
+ *
+ * TODO: currently, most debugfs data is not tracked per binder namespaces.
+ * Except for "procs" which are properly virtualized, everything else is
+ * global, including stats, logs, and dead nodes.
+ */
+struct binder_namespace {
+	struct kref kref;
+	struct binder_context *binder_context;
+	atomic_t last_id;
+
+	struct mutex procs_lock;
+	struct hlist_head procs;
+};
+
+static struct binder_namespace *create_binder_ns(void)
+{
+	struct binder_namespace *binder_ns;
+	struct binder_context *context;
+	binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
+		"create_binder_ns\n");
+
+	binder_ns = kzalloc(sizeof(struct binder_namespace), GFP_KERNEL);
+	if (binder_ns) {
+		context = kzalloc(sizeof(struct binder_context), GFP_KERNEL);
+		if(context){
+			kref_init(&binder_ns->kref);
+			mutex_init(&binder_ns->procs_lock);
+			INIT_HLIST_HEAD(&binder_ns->procs);
+			binder_ns->binder_context = context;
+			binder_ns->binder_context->binder_context_mgr_uid = INVALID_UID;
+			mutex_init(&binder_ns->binder_context->context_mgr_node_lock);
+		}
+		else{
+			return NULL;
+		}
+	}
+	return binder_ns;
+}
+
+static void free_binder_ns(struct kref *kref)
+{
+	kfree(container_of(kref, struct binder_namespace, kref));
+}
+
+
+static void get_binder_ns(struct binder_namespace *binder_ns)
+{
+	kref_get(&binder_ns->kref);
+}
+static void put_binder_ns(struct binder_namespace *binder_ns)
+{
+	kref_put(&binder_ns->kref, free_binder_ns);
+}
+
+
+/*
+ * Binder is an IPC mechanism, so tie its namespace to IPC_NS
+ * using the generic data pointer and per-ipc operations.
+ */
+static struct binder_namespace *current_binder_ns(void)
+{
+	return ipc_access_generic(current->nsproxy->ipc_ns);
+}
+
+int binder_init_ns(struct ipc_namespace *ipcns)
+{
+	struct binder_namespace *binder_ns;
+	int ret = -ENOMEM;
+
+	binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
+			"binder_init_ns\n");
+	binder_ns = create_binder_ns();
+	if (binder_ns) {
+		ipc_assign_generic(ipcns, binder_ns);	
+		ret = 0;
+	}
+	return ret;
+}
+
+void binder_exit_ns(struct ipc_namespace *ipcns)
+{
+	struct binder_namespace *binder_ns;
+
+	binder_ns = ipc_access_generic(ipcns);
+	if (binder_ns)
+		put_binder_ns(binder_ns);
+}
+
+struct peripc_operations binder_peripc_ops = {
+	.init = binder_init_ns,
+	.exit = binder_exit_ns,
+};
 /**
  * struct binder_proc - binder process bookkeeping
  * @proc_node:            element for binder_procs list
@@ -572,6 +669,8 @@ struct binder_proc {
 	struct binder_context *context;
 	spinlock_t inner_lock;
 	spinlock_t outer_lock;
+
+	struct binder_namespace *binder_ns;
 };
 
 enum {
@@ -1344,7 +1443,8 @@ static struct binder_node *binder_init_node_ilocked(
 	node->tmp_refs++;
 	rb_link_node(&node->rb_node, parent, p);
 	rb_insert_color(&node->rb_node, &proc->nodes);
-	node->debug_id = atomic_inc_return(&binder_last_id);
+	// node->debug_id = atomic_inc_return(&binder_last_id);
+	node->debug_id = atomic_inc_return(&proc->binder_ns->last_id);
 	node->proc = proc;
 	node->ptr = ptr;
 	node->cookie = cookie;
@@ -1406,8 +1506,8 @@ static int binder_inc_node_nilocked(struct binder_node *node, int strong,
 			if (target_list == NULL &&
 			    node->internal_strong_refs == 0 &&
 			    !(node->proc &&
-			      node == node->proc->context->
-				      binder_context_mgr_node &&
+			      node == node->proc->binder_ns->
+				      binder_context->binder_context_mgr_node &&
 			      node->has_strong_ref)) {
 				pr_err("invalid inc strong node for %d\n",
 					node->debug_id);
@@ -1557,6 +1657,12 @@ static void binder_inc_node_tmpref_ilocked(struct binder_node *node)
  */
 static void binder_inc_node_tmpref(struct binder_node *node)
 {
+	struct binder_namespace *binder_ns = NULL;
+	binder_ns = current_binder_ns();
+	if(binder_ns == NULL){
+		return;
+	}
+
 	binder_node_lock(node);
 	if (node->proc)
 		binder_inner_proc_lock(node->proc);
@@ -1579,6 +1685,7 @@ static void binder_inc_node_tmpref(struct binder_node *node)
 static void binder_dec_node_tmpref(struct binder_node *node)
 {
 	bool free_node;
+	struct binder_proc *proc = node->proc;
 
 	binder_node_inner_lock(node);
 	if (!node->proc)
@@ -1650,7 +1757,7 @@ static struct binder_ref *binder_get_ref_for_node_olocked(
 					struct binder_node *node,
 					struct binder_ref *new_ref)
 {
-	struct binder_context *context = proc->context;
+	struct binder_context *context = proc->binder_ns->binder_context;
 	struct rb_node **p = &proc->refs_by_node.rb_node;
 	struct rb_node *parent = NULL;
 	struct binder_ref *ref;
@@ -1671,7 +1778,8 @@ static struct binder_ref *binder_get_ref_for_node_olocked(
 		return NULL;
 
 	binder_stats_created(BINDER_STAT_REF);
-	new_ref->data.debug_id = atomic_inc_return(&binder_last_id);
+	// new_ref->data.debug_id = atomic_inc_return(&binder_last_id);
+	new_ref->data.debug_id = atomic_inc_return(&proc->binder_ns->last_id);
 	new_ref->proc = proc;
 	new_ref->node = node;
 	rb_link_node(&new_ref->rb_node_node, parent, p);
@@ -2885,8 +2993,8 @@ static void binder_transaction(struct binder_proc *proc,
 	uint32_t return_error_line = 0;
 	struct binder_buffer_object *last_fixup_obj = NULL;
 	binder_size_t last_fixup_min_off = 0;
-	struct binder_context *context = proc->context;
-	int t_debug_id = atomic_inc_return(&binder_last_id);
+	struct binder_context *context = proc->binder_ns->binder_context;
+	int t_debug_id = atomic_inc_return(&proc->binder_ns->last_id);
 
 	e = binder_transaction_log_add(&binder_transaction_log);
 	e->debug_id = t_debug_id;
@@ -2896,7 +3004,7 @@ static void binder_transaction(struct binder_proc *proc,
 	e->target_handle = tr->target.handle;
 	e->data_size = tr->data_size;
 	e->offsets_size = tr->offsets_size;
-	e->context_name = proc->context->name;
+	e->context_name = context->name;
 
 	if (reply) {
 		binder_inner_proc_lock(proc);
@@ -3442,7 +3550,7 @@ static int binder_thread_write(struct binder_proc *proc,
 			binder_size_t *consumed)
 {
 	uint32_t cmd;
-	struct binder_context *context = proc->context;
+	struct binder_context *context = proc->binder_ns->binder_context;
 	void __user *buffer = (void __user *)(uintptr_t)binder_buffer;
 	void __user *ptr = buffer + *consumed;
 	void __user *end = buffer + size;
@@ -4620,7 +4728,8 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp)
 {
 	int ret = 0;
 	struct binder_proc *proc = filp->private_data;
-	struct binder_context *context = proc->context;
+	struct binder_namespace *binder_ns = proc->binder_ns;
+	struct binder_context *context = binder_ns->binder_context;
 	struct binder_node *new_node;
 	kuid_t curr_euid = current_euid();
 
@@ -4867,10 +4976,15 @@ err_bad_arg:
 static int binder_open(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc;
-	struct binder_device *binder_dev;
+	// struct binder_device *binder_dev;
+	struct binder_namespace *binder_ns;
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "binder_open: %d:%d\n",
 		     current->group_leader->pid, current->pid);
+
+	binder_ns = current_binder_ns();
+	if (binder_ns == NULL)
+		return -ENOMEM;
 
 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
 	if (proc == NULL)
@@ -4888,9 +5002,12 @@ static int binder_open(struct inode *nodp, struct file *filp)
 		proc->default_priority.prio = NICE_TO_PRIO(0);
 	}
 
-	binder_dev = container_of(filp->private_data, struct binder_device,
-				  miscdev);
-	proc->context = &binder_dev->context;
+	proc->binder_ns = binder_ns;
+	get_binder_ns(binder_ns);
+
+	// binder_dev = container_of(filp->private_data, struct binder_device,
+	// 			  miscdev);
+	// proc->context = &binder_dev->context;
 	binder_alloc_init(&proc->alloc);
 
 	binder_stats_created(BINDER_STAT_PROC);
@@ -4899,9 +5016,9 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	INIT_LIST_HEAD(&proc->waiting_threads);
 	filp->private_data = proc;
 
-	mutex_lock(&binder_procs_lock);
-	hlist_add_head(&proc->proc_node, &binder_procs);
-	mutex_unlock(&binder_procs_lock);
+	mutex_lock(&proc->binder_ns->procs_lock);
+	hlist_add_head(&proc->proc_node, &binder_ns->procs);
+	mutex_unlock(&proc->binder_ns->procs_lock);
 
 	if (binder_debugfs_dir_entry_proc) {
 		char strbuf[11];
@@ -4969,6 +5086,7 @@ static int binder_node_release(struct binder_node *node, int refs)
 	struct binder_ref *ref;
 	int death = 0;
 	struct binder_proc *proc = node->proc;
+	struct binder_namespace *binder_ns = proc->binder_ns;
 
 	binder_release_work(proc, &node->async_todo);
 
@@ -5031,15 +5149,16 @@ static int binder_node_release(struct binder_node *node, int refs)
 
 static void binder_deferred_release(struct binder_proc *proc)
 {
-	struct binder_context *context = proc->context;
+	struct binder_namespace *binder_ns = proc->binder_ns;
+	struct binder_context *context = binder_ns->binder_context;
 	struct rb_node *n;
 	int threads, nodes, incoming_refs, outgoing_refs, active_transactions;
 
 	BUG_ON(proc->files);
 
-	mutex_lock(&binder_procs_lock);
+	mutex_lock(&binder_ns->procs_lock);
 	hlist_del(&proc->proc_node);
-	mutex_unlock(&binder_procs_lock);
+	mutex_unlock(&binder_ns->procs_lock);
 
 	mutex_lock(&context->context_mgr_node_lock);
 	if (context->binder_context_mgr_node &&
@@ -5107,6 +5226,8 @@ static void binder_deferred_release(struct binder_proc *proc)
 	binder_release_work(proc, &proc->todo);
 	binder_release_work(proc, &proc->delivered_death);
 
+	put_binder_ns(proc->binder_ns);
+
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
 		     "%s: %d threads %d, nodes %d (ref %d), refs %d, active transactions %d\n",
 		     __func__, proc->pid, threads, nodes, incoming_refs,
@@ -5119,8 +5240,13 @@ static void binder_deferred_func(struct work_struct *work)
 {
 	struct binder_proc *proc;
 	struct files_struct *files;
+	struct binder_namespace *binder_ns = NULL;
 
 	int defer;
+
+	binder_ns = current_binder_ns();
+	if (binder_ns == NULL)
+		return;
 
 	do {
 		mutex_lock(&binder_deferred_lock);
@@ -5345,7 +5471,7 @@ static void print_binder_proc(struct seq_file *m,
 	struct binder_node *last_node = NULL;
 
 	seq_printf(m, "proc %d\n", proc->pid);
-	seq_printf(m, "context %s\n", proc->context->name);
+	seq_printf(m, "context %s\n", proc->binder_ns->binder_context->name);
 	header_pos = m->count;
 
 	binder_inner_proc_lock(proc);
@@ -5506,7 +5632,7 @@ static void print_binder_proc_stats(struct seq_file *m,
 		binder_alloc_get_free_async_space(&proc->alloc);
 
 	seq_printf(m, "proc %d\n", proc->pid);
-	seq_printf(m, "context %s\n", proc->context->name);
+	seq_printf(m, "context %s\n", proc->binder_ns->binder_context->name);
 	count = 0;
 	ready_threads = 0;
 	binder_inner_proc_lock(proc);
@@ -5562,9 +5688,14 @@ static void print_binder_proc_stats(struct seq_file *m,
 
 static int binder_state_show(struct seq_file *m, void *unused)
 {
+	struct binder_namespace *binder_ns = current_binder_ns();
+
 	struct binder_proc *proc;
 	struct binder_node *node;
 	struct binder_node *last_node = NULL;
+
+	if (binder_ns == NULL)
+		return 0;
 
 	seq_puts(m, "binder state:\n");
 
@@ -5591,56 +5722,69 @@ static int binder_state_show(struct seq_file *m, void *unused)
 	if (last_node)
 		binder_put_node(last_node);
 
-	mutex_lock(&binder_procs_lock);
-	hlist_for_each_entry(proc, &binder_procs, proc_node)
+	mutex_lock(&binder_ns->procs_lock);
+	hlist_for_each_entry(proc, &binder_ns->procs, proc_node)
 		print_binder_proc(m, proc, 1);
-	mutex_unlock(&binder_procs_lock);
+	mutex_unlock(&binder_ns->procs_lock);
 
 	return 0;
 }
 
 static int binder_stats_show(struct seq_file *m, void *unused)
 {
+	struct binder_namespace *binder_ns = current_binder_ns();
+
 	struct binder_proc *proc;
+
+	if (binder_ns == NULL)
+		return 0;
 
 	seq_puts(m, "binder stats:\n");
 
 	print_binder_stats(m, "", &binder_stats);
 
-	mutex_lock(&binder_procs_lock);
-	hlist_for_each_entry(proc, &binder_procs, proc_node)
+	mutex_lock(&binder_ns->procs_lock);
+	hlist_for_each_entry(proc, &binder_ns->procs, proc_node)
 		print_binder_proc_stats(m, proc);
-	mutex_unlock(&binder_procs_lock);
+	mutex_unlock(&binder_ns->procs_lock);
 
 	return 0;
 }
 
 static int binder_transactions_show(struct seq_file *m, void *unused)
 {
+	struct binder_namespace *binder_ns = current_binder_ns();
 	struct binder_proc *proc;
 
+	if (binder_ns == NULL)
+		return 0;
+
 	seq_puts(m, "binder transactions:\n");
-	mutex_lock(&binder_procs_lock);
-	hlist_for_each_entry(proc, &binder_procs, proc_node)
+	mutex_lock(&binder_ns->procs_lock);
+	hlist_for_each_entry(proc, &binder_ns->procs, proc_node)
 		print_binder_proc(m, proc, 0);
-	mutex_unlock(&binder_procs_lock);
+	mutex_unlock(&binder_ns->procs_lock);
 
 	return 0;
 }
 
 static int binder_proc_show(struct seq_file *m, void *unused)
 {
+	struct binder_namespace *binder_ns = current_binder_ns();
 	struct binder_proc *itr;
 	int pid = (unsigned long)m->private;
 
-	mutex_lock(&binder_procs_lock);
-	hlist_for_each_entry(itr, &binder_procs, proc_node) {
+	if (binder_ns == NULL)
+		return 0;
+
+	mutex_lock(&binder_ns->procs_lock);
+	hlist_for_each_entry(itr, &binder_ns->procs, proc_node) {
 		if (itr->pid == pid) {
 			seq_puts(m, "binder proc state:\n");
 			print_binder_proc(m, itr, 1);
 		}
 	}
-	mutex_unlock(&binder_procs_lock);
+	mutex_unlock(&binder_ns->procs_lock);
 
 	return 0;
 }
@@ -5742,6 +5886,10 @@ static int __init binder_init(void)
 	char *device_name, *device_names;
 	struct binder_device *device;
 	struct hlist_node *tmp;
+
+	ret = register_peripc_ops(&binder_peripc_ops);
+	if (ret < 0)
+		return ret;
 
 	binder_alloc_shrinker_init();
 

@@ -52,9 +52,17 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	ns->user_ns = get_user_ns(user_ns);
 	ns->ucounts = ucounts;
 
+	err = init_peripc_ns(ns);
+	if (err) {
+		kfree(ns);
+		return ERR_PTR(err);
+	}
+
 	err = mq_init_ns(ns);
-	if (err)
+	if (err){
+		exit_peripc_ns(ns);
 		goto fail_put;
+	}
 
 	sem_init_ns(ns);
 	msg_init_ns(ns);
@@ -117,6 +125,7 @@ static void free_ipc_ns(struct ipc_namespace *ns)
 	sem_exit_ns(ns);
 	msg_exit_ns(ns);
 	shm_exit_ns(ns);
+	exit_peripc_ns(ns);
 
 	dec_ipc_namespaces(ns->ucounts);
 	put_user_ns(ns->user_ns);
